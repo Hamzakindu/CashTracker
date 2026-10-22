@@ -1,0 +1,50 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Accepts any zip name (CashTracker.zip, cashtracker.zip ...), with or without a folder inside.
+      - name: Unpack project zip
+        run: |
+          mkdir -p _src
+          for z in $(ls *.zip *.ZIP 2>/dev/null | LC_ALL=C sort); do
+            echo "Unpacking $z"
+            unzip -o -q "$z" -d _src
+          done
+
+      - name: Find project folder
+        run: |
+          settings=$(find _src -name settings.gradle.kts 2>/dev/null | head -1)
+          if [ -z "$settings" ]; then settings=$(find . -name settings.gradle.kts -not -path './.git/*' | head -1); fi
+          if [ -z "$settings" ]; then echo "No settings.gradle.kts found. Upload the project zip to the repo root."; ls -la; exit 1; fi
+          dir=$(dirname "$settings")
+          echo "Project folder: $dir"
+          echo "BUILD_DIR=$dir" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+        working-directory: ${{ env.BUILD_DIR }}
+
+      - name: Name the APK
+        run: cp "$BUILD_DIR/app/build/outputs/apk/debug/app-debug.apk" "$GITHUB_WORKSPACE/CashTracker.apk"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          files: CashTracker.apk
