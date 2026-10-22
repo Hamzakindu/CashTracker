@@ -15,45 +15,39 @@ jobs:
       - name: Unpack project zip
         run: |
           mkdir -p _src
-          # Find zips safely, even if they have spaces in the name
-          find . -maxdepth 1 -type f \( -iname "*.zip" \) | while read -r z; do
+          FOUND_ZIP=0
+          for z in $(ls *.zip *.ZIP 2>/dev/null | LC_ALL=C sort); do
+            FOUND_ZIP=1
             echo "Unpacking $z"
             unzip -o -q "$z" -d _src
           done
+          
+          if [ $FOUND_ZIP -eq 0 ]; then
+            echo "❌ ERROR: No .zip file found in the root of the repository."
+            echo "Please upload your project zip (e.g., CashTracker.zip) to the repository."
+            exit 1
+          fi
 
       - name: Find project folder
         run: |
-          # Look for settings.gradle.kts or settings.gradle
-          settings=$(find _src -name settings.gradle.kts -o -name settings.gradle 2>/dev/null | head -1)
-          if [ -z "$settings" ]; then 
-            settings=$(find . -name settings.gradle.kts -o -name settings.gradle -not -path './.git/*' | head -1)
-          fi
-          
-          if [ -z "$settings" ]; then 
-            echo "❌ Error: No settings.gradle or settings.gradle.kts found."
-            echo "Did you commit the zip file to the repository?"
-            ls -la
-            exit 1
-          fi
-          
+          settings=$(find _src -name settings.gradle.kts 2>/dev/null | head -1)
+          if [ -z "$settings" ]; then settings=$(find . -name settings.gradle.kts -not -path './.git/*' | head -1); fi
+          if [ -z "$settings" ]; then echo "No settings.gradle.kts found inside the unzipped folder. Check your zip structure."; exit 1; fi
           dir=$(dirname "$settings")
-          echo "✅ Project folder found: $dir"
+          echo "Project folder: $dir"
           echo "BUILD_DIR=$dir" >> "$GITHUB_ENV"
 
-      - name: Set up Java
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.9
 
       - name: Build debug APK
         run: |
-          # Use local wrapper if it exists, otherwise use global gradle
           if [ -f "gradlew" ]; then
             chmod +x gradlew
             ./gradlew assembleDebug --no-daemon --stacktrace
@@ -64,19 +58,16 @@ jobs:
 
       - name: Name the APK
         run: |
-          # Verify the APK exists before copying
           APK_PATH="$BUILD_DIR/app/build/outputs/apk/debug/app-debug.apk"
           if [ -f "$APK_PATH" ]; then
             cp "$APK_PATH" "$GITHUB_WORKSPACE/CashTracker.apk"
           else
             echo "❌ Error: app-debug.apk not found at $APK_PATH"
-            # Optional: List files to help debug
             find "$BUILD_DIR" -name "*.apk"
             exit 1
           fi
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
           files: CashTracker.apk
