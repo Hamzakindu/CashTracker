@@ -1,0 +1,28 @@
+name: One-time keystore generator
+
+on:
+  workflow_dispatch:
+
+jobs:
+  keygen:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Generate keystore
+        env:
+          PASS: ${{ secrets.RELEASE_STORE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$PASS" || { echo "Set RELEASE_STORE_PASSWORD first" >&2; exit 1; }
+          keytool -genkeypair -keystore release.jks -storetype PKCS12 \
+            -alias cashtracker-release -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass:env PASS -keypass:env PASS -dname "CN=CashTracker"
+          keytool -list -keystore release.jks -storepass:env PASS
+          base64 -w0 release.jks > keystore.b64.txt
+
+      - name: Upload keystore text
+        uses: actions/upload-artifact@v4
+        with:
+          name: keystore-b64
+          path: keystore.b64.txt
+          retention-days: 1
