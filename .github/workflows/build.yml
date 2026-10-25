@@ -1,4 +1,4 @@
-JJname: Build CashTracker APK
+name: Build CashTracker APK
 
 on:
   push:
