@@ -1,0 +1,321 @@
+name: Build CashTracker APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      generate_keystore:
+        description: "ONE-TIME SETUP: generate a new signing keystore instead of building"
+        type: boolean
+        default: false
+      export_keystore:
+        description: "SAVE A COPY: export the current signing keystore text from the secret instead of building"
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  # ------------------------------------------------------------------
+  # One-time helper. Run manually: Actions > Build CashTracker APK >
+  # Run workflow > tick "generate a new signing keystore".
+  # Needs the secret RELEASE_STORE_PASSWORD (min 8 chars, letters/digits).
+  # ------------------------------------------------------------------
+  keystore:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.generate_keystore && !inputs.export_keystore }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Generate keystore
+        env:
+          PASS: ${{ secrets.RELEASE_STORE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$PASS" || { echo "::error::Create the secret RELEASE_STORE_PASSWORD first."; exit 1; }
+          test "${#PASS}" -ge 8 || { echo "::error::RELEASE_STORE_PASSWORD must be at least 8 characters."; exit 1; }
+          keytool -genkeypair -keystore release.jks -storetype PKCS12 \
+            -alias cashtracker-release -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass:env PASS -keypass:env PASS -dname "CN=CashTracker"
+          B64="$(base64 -w0 release.jks)"
+          {
+            echo "## New signing keystore"
+            echo
+            echo "1. Copy the whole text below into the secret **RELEASE_KEYSTORE_B64**."
+            echo "2. Set **RELEASE_KEY_PASSWORD** to the same value as RELEASE_STORE_PASSWORD."
+            echo "3. Set **RELEASE_KEY_ALIAS** to \`cashtracker-release\`."
+            echo "4. Then DELETE this workflow run (three dots > Delete workflow run)."
+            echo
+            echo '```'
+            echo "$B64"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Keystore generated. Open the run Summary page to copy it."
+
+  # ------------------------------------------------------------------
+  # Safety copy. Run manually with "SAVE A COPY" ticked. Gives you the
+  # keystore text that is stored in the RELEASE_KEYSTORE_B64 secret.
+  # Keep the copy and the password somewhere safe, then delete the run.
+  # ------------------------------------------------------------------
+  export-keystore:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.export_keystore }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Export keystore copy
+        env:
+          RELEASE_KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_KEYSTORE_B64" || { echo "::error::The secret RELEASE_KEYSTORE_B64 is empty or missing."; exit 1; }
+          printf '%s' "$RELEASE_KEYSTORE_B64" | tr -d '[:space:]' > keystore-copy.txt
+          base64 --decode < keystore-copy.txt > check.jks
+          test -s check.jks || { echo "::error::The secret does not contain a valid keystore."; exit 1; }
+          {
+            echo "## Keystore copy"
+            echo
+            echo "Save this text AND your keystore password somewhere safe. Then DELETE this workflow run."
+            echo "If the box below shows only stars, download the artifact named keystore-copy instead."
+            echo
+            echo '```'
+            cat keystore-copy.txt
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload keystore copy
+        uses: actions/upload-artifact@v4
+        with:
+          name: keystore-copy
+          path: keystore-copy.txt
+          retention-days: 1
+
+  build:
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.generate_keystore && !inputs.export_keystore) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Locate Android project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Use the most recently uploaded .zip in the repo (any file name), so a re-upload such as
+          # "cashtracker_1.zip" or "cashtracker (1).zip" is not ignored in favour of an older file.
+          ZIP=""; BEST=-1
+          shopt -s nullglob
+          for z in ./*.zip; do
+            TS="$(git log -1 --format=%ct -- "$z" 2>/dev/null || true)"; TS="${TS:-0}"
+            if (( TS >= BEST )); then BEST=$TS; ZIP="$z"; fi
+          done
+          shopt -u nullglob
+          if [[ -n "$ZIP" ]]; then
+            SRC_DIR="$RUNNER_TEMP/cashtracker-source"
+            mkdir -p "$SRC_DIR"
+            unzip -q "$ZIP" -d "$SRC_DIR"
+            echo "Using zip: $ZIP (last uploaded: $(date -u -d "@$BEST" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo unknown))"
+            echo "Zips found: $(ls -1 ./*.zip | tr '\n' ' ')"
+          else
+            SRC_DIR="$GITHUB_WORKSPACE"
+            echo "No zip file; using repository files"
+          fi
+
+          if [[ -f "$SRC_DIR/CashTracker/settings.gradle.kts" && -f "$SRC_DIR/CashTracker/app/build.gradle.kts" ]]; then
+            PROJECT_DIR="$SRC_DIR/CashTracker"
+          elif [[ -f "$SRC_DIR/settings.gradle.kts" && -f "$SRC_DIR/app/build.gradle.kts" ]]; then
+            PROJECT_DIR="$SRC_DIR"
+          else
+            echo "::error::Could not find the Android Gradle project (settings.gradle.kts + app/build.gradle.kts)."
+            find "$SRC_DIR" -maxdepth 4 -name settings.gradle.kts -print
+            exit 1
+          fi
+
+          test -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml"
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Android project found at: $PROJECT_DIR"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install JavaScript dependencies and run checks
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f package.json ]]; then
+            npm install --ignore-scripts --no-audit --no-fund
+            npm test --if-present
+            npm run typecheck --if-present
+            npm run build:ts --if-present
+          else
+            echo "No package.json found; skipping JavaScript checks."
+          fi
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Prepare and verify release signing key
+        env:
+          RELEASE_KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set +e                      # GitHub runs bash with -e; we handle errors ourselves
+          set -uo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+
+          [[ -n "$RELEASE_KEYSTORE_B64" ]]     || fail "Missing GitHub secret RELEASE_KEYSTORE_B64."
+          [[ -n "$RELEASE_STORE_PASSWORD" ]]   || fail "Missing GitHub secret RELEASE_STORE_PASSWORD."
+          [[ -n "$RELEASE_KEY_ALIAS" ]]        || fail "Missing GitHub secret RELEASE_KEY_ALIAS."
+
+          STORE_PW="$(trim "$RELEASE_STORE_PASSWORD")"
+          KEY_PW="$(trim "${RELEASE_KEY_PASSWORD:-$RELEASE_STORE_PASSWORD}")"
+          ALIAS="$(trim "$RELEASE_KEY_ALIAS")"
+
+          mkdir -p "$RUNNER_TEMP/cashtracker-signing"
+          JKS="$RUNNER_TEMP/cashtracker-signing/release.jks"
+          printf '%s' "$RELEASE_KEYSTORE_B64" | tr -d '[:space:]' | base64 --decode > "$JKS" 2>/dev/null \
+            || fail "RELEASE_KEYSTORE_B64 is not valid base64. Re-copy the complete text as one piece."
+          test -s "$JKS" || fail "RELEASE_KEYSTORE_B64 decoded to an empty file."
+          chmod 600 "$JKS"
+
+          cat > "$RUNNER_TEMP/CheckKey.java" <<'JAVA'
+          import java.io.File;
+          import java.security.KeyStore;
+          import java.util.Collections;
+
+          public class CheckKey {
+            public static void main(String[] a) throws Exception {
+              String path = a[0], alias = a[1];
+              String store = System.getenv("CK_STORE"), key = System.getenv("CK_KEY");
+              KeyStore ks;
+              try {
+                ks = KeyStore.getInstance(new File(path), store.toCharArray());
+              } catch (Exception e) {
+                String m = String.valueOf(e.getMessage());
+                if (m.toLowerCase().contains("password")) { System.out.println("RESULT=STORE_PASSWORD_WRONG"); System.exit(2); }
+                System.out.println("RESULT=BAD_KEYSTORE_FILE"); System.exit(5); return;
+              }
+              if (!ks.containsAlias(alias)) {
+                System.out.println("RESULT=ALIAS_MISSING");
+                System.out.println("ALIASES=" + Collections.list(ks.aliases()));
+                System.exit(3);
+              }
+              System.out.println("TYPE=" + ks.getType());
+              String[][] candidates = { {"key", key}, {"store", store} };
+              for (String[] c : candidates) {
+                try {
+                  if (ks.getKey(alias, c[1].toCharArray()) != null) { System.out.println("RESULT=OK"); System.out.println("KEY_PASSWORD_SOURCE=" + c[0]); return; }
+                } catch (java.security.UnrecoverableKeyException e) { /* try next */ }
+              }
+              System.out.println("RESULT=KEY_PASSWORD_WRONG"); System.exit(4);
+            }
+          }
+          JAVA
+
+          OUT="$(CK_STORE="$STORE_PW" CK_KEY="$KEY_PW" java "$RUNNER_TEMP/CheckKey.java" "$JKS" "$ALIAS" 2>&1)"
+          RESULT="$(printf '%s\n' "$OUT" | sed -n 's/^RESULT=//p' | head -n1)"
+          echo "Keystore check: ${RESULT:-no result}"
+          printf '%s\n' "$OUT" | grep -E '^(TYPE|ALIASES|KEY_PASSWORD_SOURCE)=' || true
+
+          case "$RESULT" in
+            OK) ;;
+            STORE_PASSWORD_WRONG) fail "RELEASE_STORE_PASSWORD does not open the keystore. Re-enter it, or regenerate the keystore (run this workflow manually with the keystore option)." ;;
+            BAD_KEYSTORE_FILE)    fail "RELEASE_KEYSTORE_B64 is not a valid keystore (likely cut off when copied). Re-copy the full text, or regenerate the keystore." ;;
+            ALIAS_MISSING)        fail "RELEASE_KEY_ALIAS does not exist in the keystore. Use one of the ALIASES shown above." ;;
+            KEY_PASSWORD_WRONG)   fail "RELEASE_KEY_PASSWORD does not unlock the key. Set it to the same value as RELEASE_STORE_PASSWORD, or regenerate the keystore." ;;
+            *) echo "$OUT"; fail "Unexpected keystore check result." ;;
+          esac
+
+          {
+            echo "RELEASE_STORE_FILE=$JKS"
+            echo "KEY_PASSWORD_SOURCE=$(printf '%s\n' "$OUT" | sed -n 's/^KEY_PASSWORD_SOURCE=//p' | head -n1)"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify Gradle project
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f settings.gradle.kts
+          test -f app/build.gradle.kts
+          test -f app/src/main/AndroidManifest.xml
+          test ! -f app/debug.keystore
+          java -version
+          gradle --version
+
+      - name: Build signed release APK
+        working-directory: ${{ steps.project.outputs.dir }}
+        env:
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+          export RELEASE_STORE_PASSWORD="$(trim "$RELEASE_STORE_PASSWORD")"
+          export RELEASE_KEY_ALIAS="$(trim "$RELEASE_KEY_ALIAS")"
+          if [[ "${KEY_PASSWORD_SOURCE:-key}" == "store" || -z "${RELEASE_KEY_PASSWORD:-}" ]]; then
+            export RELEASE_KEY_PASSWORD="$RELEASE_STORE_PASSWORD"
+          else
+            export RELEASE_KEY_PASSWORD="$(trim "$RELEASE_KEY_PASSWORD")"
+          fi
+          gradle :app:assembleRelease --no-daemon --stacktrace \
+            -PVERSION_CODE="${GITHUB_RUN_NUMBER}" \
+            -PVERSION_NAME="5.10.43-b${GITHUB_RUN_NUMBER}"
+
+      - name: Find and stage APK
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$APK" || {
+            echo "::error::Gradle did not produce a release APK."
+            exit 1
+          }
+          cp "$APK" "$GITHUB_WORKSPACE/CashTracker-release.apk"
+          ls -lh "$GITHUB_WORKSPACE/CashTracker-release.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CashTracker-release
+          path: CashTracker-release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: CashTracker v${{ github.run_number }}
+          files: CashTracker-release.apk
+          generate_release_notes: true
